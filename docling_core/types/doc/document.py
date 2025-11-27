@@ -35,9 +35,11 @@ from pydantic import (
     AnyUrl,
     BaseModel,
     ConfigDict,
+    Discriminator,
     Field,
     FieldSerializationInfo,
     StringConstraints,
+    Tag,
     computed_field,
     field_serializer,
     field_validator,
@@ -66,6 +68,7 @@ from docling_core.types.doc.labels import (
 )
 from docling_core.types.doc.tokens import DocumentToken, TableToken
 from docling_core.types.doc.utils import parse_otsl_table_content, relative_path
+from docling_core.types.doc.webvtt import _WebVTTTimestamp
 
 _logger = logging.getLogger(__name__)
 
@@ -1206,11 +1209,85 @@ class DocTagsDocument(BaseModel):
 
 
 class ProvenanceItem(BaseModel):
-    """ProvenanceItem."""
+    """Provenance information for elements extracted from a textual document.
 
-    page_no: int
-    bbox: BoundingBox
-    charspan: Tuple[int, int]
+    A `ProvenanceItem` object acts as a lightweight pointer back into the original
+    document for an extracted element. It applies to documents with an explicity
+    or implicit layout, such as PDF, HTML, docx, or pptx.
+    """
+
+    page_no: Annotated[int, Field(description="Page number")]
+    bbox: Annotated[BoundingBox, Field(description="Bounding box")]
+    charspan: Annotated[
+        tuple[int, int], Field(description="Character span (0-indexed)")
+    ]
+
+
+class ProvenanceTrack(BaseModel):
+    """Provenance information for elements extracted from media assets.
+
+    A `ProvenanceTrack` instance describes a cue in a text track associated with a
+    media element (audio, video, subtitles, screen recordings, ...).
+    """
+
+    start_time: Annotated[
+        _WebVTTTimestamp,
+        Field(
+            examples=["00.11.000", "00:00:06.500", "01:28:34.300"],
+            description="Start time offset of the track cue",
+        ),
+    ]
+    end_time: Annotated[
+        _WebVTTTimestamp,
+        Field(
+            examples=["00.12.000", "00:00:08.200", "01:29:30.100"],
+            description="End time offset of the track cue",
+        ),
+    ]
+    identifier: Optional[str] = Field(
+        None,
+        examples=["test", "123", "b72d946"],
+        description="An identifier of the cue",
+    )
+    voice: Optional[str] = Field(
+        None,
+        examples=["Mary", "Fred", "Name Surname"],
+        description="The cue voice (speaker)",
+    )
+    language: Optional[str] = Field(
+        None,
+        examples=["en", "en-GB", "fr-CA"],
+        description="Language of the cue in BCP 47 language tag format",
+    )
+    classes: Optional[list[str]] = Field(
+        None,
+        min_length=1,
+        examples=["first", "loud", "yellow"],
+        description="Classes for describing the cue significance",
+    )
+
+
+def get_provenance_discriminator_value(v: Any) -> str:
+    """Callable discriminator for provenance instances.
+
+    Args:
+        v: Either dict or model input.
+
+    Returns:
+        A string discriminator of provenance instances.
+    """
+    fields = {"bbox", "page_no", "charspan"}
+    if isinstance(v, dict):
+        return "item" if any(f in v for f in fields) else "track"
+    return "item" if any(hasattr(v, f) for f in fields) else "track"
+
+
+ProvenanceType = Annotated[
+    Union[
+        Annotated[ProvenanceItem, Tag("item")], Annotated[ProvenanceTrack, Tag("track")]
+    ],
+    Discriminator(get_provenance_discriminator_value),
+]
 
 
 class ContentLayer(str, Enum):
@@ -1534,7 +1611,7 @@ class DocItem(
     """DocItem."""
 
     label: DocItemLabel
-    prov: List[ProvenanceItem] = []
+    prov: List[ProvenanceType] = []
 
     def get_location_tokens(
         self,
@@ -1549,7 +1626,7 @@ class DocItem(
             return ""
 
         location = ""
-        for prov in self.prov:
+        for prov in (item for item in self.prov if isinstance(item, ProvenanceItem)):
             page_w, page_h = doc.pages[prov.page_no].size.as_tuple()
 
             loc_str = DocumentToken.get_location(
@@ -1573,10 +1650,13 @@ class DocItem(
         if a valid image of the page containing this DocItem is not available
         in doc.
         """
-        if not len(self.prov):
+        if not self.prov or prov_index >= len(self.prov):
+            return None
+        prov = self.prov[prov_index]
+        if not isinstance(prov, ProvenanceItem):
             return None
 
-        page = doc.pages.get(self.prov[prov_index].page_no)
+        page = doc.pages.get(prov.page_no)
         if page is None or page.size is None or page.image is None:
             return None
 
@@ -1584,9 +1664,9 @@ class DocItem(
         if not page_image:
             return None
         crop_bbox = (
-            self.prov[prov_index]
-            .bbox.to_top_left_origin(page_height=page.size.height)
-            .scale_to_size(old_size=page.size, new_size=page.image.size)
+            prov.bbox.to_top_left_origin(page_height=page.size.height).scale_to_size(
+                old_size=page.size, new_size=page.image.size
+            )
             # .scaled(scale=page_image.height / page.size.height)
         )
         return page_image.crop(crop_bbox.as_tuple())
@@ -2278,7 +2358,7 @@ class TableItem(FloatingItem):
             return ""
 
         page_no = 0
-        if len(self.prov) > 0:
+        if len(self.prov) > 0 and isinstance(self.prov[0], ProvenanceItem):
             page_no = self.prov[0].page_no
 
         for i in range(nrows):
@@ -2410,7 +2490,7 @@ class GraphCell(BaseModel):
     text: str  # sanitized text
     orig: str  # text as seen on document
 
-    prov: Optional[ProvenanceItem] = None
+    prov: Optional[ProvenanceType] = None
 
     # in case you have a text, table or picture item
     item_ref: Optional[RefItem] = None
@@ -3101,7 +3181,7 @@ class DoclingDocument(BaseModel):
         enumerated: bool = False,
         marker: Optional[str] = None,
         orig: Optional[str] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
@@ -3112,7 +3192,7 @@ class DoclingDocument(BaseModel):
         :param label: str:
         :param text: str:
         :param orig: Optional[str]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
 
         """
@@ -3153,7 +3233,7 @@ class DoclingDocument(BaseModel):
         label: DocItemLabel,
         text: str,
         orig: Optional[str] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
@@ -3164,7 +3244,7 @@ class DoclingDocument(BaseModel):
         :param label: str:
         :param text: str:
         :param orig: Optional[str]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
 
         """
@@ -3259,7 +3339,7 @@ class DoclingDocument(BaseModel):
         self,
         data: TableData,
         caption: Optional[Union[TextItem, RefItem]] = None,  # This is not cool yet.
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
         label: DocItemLabel = DocItemLabel.TABLE,
         content_layer: Optional[ContentLayer] = None,
@@ -3269,7 +3349,7 @@ class DoclingDocument(BaseModel):
 
         :param data: TableData:
         :param caption: Optional[Union[TextItem, RefItem]]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
         :param label: DocItemLabel:  (Default value = DocItemLabel.TABLE)
 
@@ -3305,7 +3385,7 @@ class DoclingDocument(BaseModel):
         annotations: Optional[List[PictureDataType]] = None,
         image: Optional[ImageRef] = None,
         caption: Optional[Union[TextItem, RefItem]] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
         content_layer: Optional[ContentLayer] = None,
     ):
@@ -3314,7 +3394,7 @@ class DoclingDocument(BaseModel):
         :param data: Optional[List[PictureData]]: (Default value = None)
         :param caption: Optional[Union[TextItem:
         :param RefItem]]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
         """
         if not parent:
@@ -3346,7 +3426,7 @@ class DoclingDocument(BaseModel):
         self,
         text: str,
         orig: Optional[str] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
@@ -3357,7 +3437,7 @@ class DoclingDocument(BaseModel):
         :param text: str:
         :param orig: Optional[str]:  (Default value = None)
         :param level: LevelNumber:  (Default value = 1)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
         """
         if not parent:
@@ -3392,7 +3472,7 @@ class DoclingDocument(BaseModel):
         code_language: Optional[CodeLanguageLabel] = None,
         orig: Optional[str] = None,
         caption: Optional[Union[TextItem, RefItem]] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
@@ -3405,7 +3485,7 @@ class DoclingDocument(BaseModel):
         :param orig: Optional[str]:  (Default value = None)
         :param caption: Optional[Union[TextItem:
         :param RefItem]]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
         """
         if not parent:
@@ -3442,7 +3522,7 @@ class DoclingDocument(BaseModel):
         self,
         text: str,
         orig: Optional[str] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
@@ -3453,7 +3533,7 @@ class DoclingDocument(BaseModel):
         :param text: str:
         :param orig: Optional[str]:  (Default value = None)
         :param level: LevelNumber:  (Default value = 1)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
         """
         if not parent:
@@ -3487,7 +3567,7 @@ class DoclingDocument(BaseModel):
         text: str,
         orig: Optional[str] = None,
         level: LevelNumber = 1,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
@@ -3499,7 +3579,7 @@ class DoclingDocument(BaseModel):
         :param text: str:
         :param orig: Optional[str]:  (Default value = None)
         :param level: LevelNumber:  (Default value = 1)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
         """
         if not parent:
@@ -3532,13 +3612,13 @@ class DoclingDocument(BaseModel):
     def add_key_values(
         self,
         graph: GraphData,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
     ):
         """add_key_values.
 
         :param graph: GraphData:
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
         """
         if not parent:
@@ -3563,13 +3643,13 @@ class DoclingDocument(BaseModel):
     def add_form(
         self,
         graph: GraphData,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         parent: Optional[NodeItem] = None,
     ):
         """add_form.
 
         :param graph: GraphData:
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param parent: Optional[NodeItem]:  (Default value = None)
         """
         if not parent:
@@ -3766,7 +3846,7 @@ class DoclingDocument(BaseModel):
         enumerated: bool = False,
         marker: Optional[str] = None,
         orig: Optional[str] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
         hyperlink: Optional[Union[AnyUrl, Path]] = None,
@@ -3779,7 +3859,7 @@ class DoclingDocument(BaseModel):
         :param enumerated: bool:  (Default value = False)
         :param marker: Optional[str]:  (Default value = None)
         :param orig: Optional[str]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param content_layer: Optional[ContentLayer]:  (Default value = None)
         :param formatting: Optional[Formatting]:  (Default value = None)
         :param hyperlink: Optional[Union[AnyUrl, Path]]:  (Default value = None)
@@ -3840,7 +3920,7 @@ class DoclingDocument(BaseModel):
         label: DocItemLabel,
         text: str,
         orig: Optional[str] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
         hyperlink: Optional[Union[AnyUrl, Path]] = None,
@@ -3852,7 +3932,7 @@ class DoclingDocument(BaseModel):
         :param label: DocItemLabel:
         :param text: str:
         :param orig: Optional[str]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param content_layer: Optional[ContentLayer]:  (Default value = None)
         :param formatting: Optional[Formatting]:  (Default value = None)
         :param hyperlink: Optional[Union[AnyUrl, Path]]:  (Default value = None)
@@ -3952,7 +4032,7 @@ class DoclingDocument(BaseModel):
         sibling: NodeItem,
         data: TableData,
         caption: Optional[Union[TextItem, RefItem]] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         label: DocItemLabel = DocItemLabel.TABLE,
         content_layer: Optional[ContentLayer] = None,
         annotations: Optional[list[TableAnnotationType]] = None,
@@ -3963,7 +4043,7 @@ class DoclingDocument(BaseModel):
         :param sibling: NodeItem:
         :param data: TableData:
         :param caption: Optional[Union[TextItem, RefItem]]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param label: DocItemLabel:  (Default value = DocItemLabel.TABLE)
         :param content_layer: Optional[ContentLayer]:  (Default value = None)
         :param annotations: Optional[List[TableAnnotationType]]: (Default value = None)
@@ -4000,7 +4080,7 @@ class DoclingDocument(BaseModel):
         annotations: Optional[List[PictureDataType]] = None,
         image: Optional[ImageRef] = None,
         caption: Optional[Union[TextItem, RefItem]] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         content_layer: Optional[ContentLayer] = None,
         after: bool = True,
     ) -> PictureItem:
@@ -4010,7 +4090,7 @@ class DoclingDocument(BaseModel):
         :param annotations: Optional[List[PictureDataType]]: (Default value = None)
         :param image: Optional[ImageRef]:  (Default value = None)
         :param caption: Optional[Union[TextItem, RefItem]]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param content_layer: Optional[ContentLayer]:  (Default value = None)
         :param after: bool:  (Default value = True)
 
@@ -4044,7 +4124,7 @@ class DoclingDocument(BaseModel):
         sibling: NodeItem,
         text: str,
         orig: Optional[str] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
         hyperlink: Optional[Union[AnyUrl, Path]] = None,
@@ -4055,7 +4135,7 @@ class DoclingDocument(BaseModel):
         :param sibling: NodeItem:
         :param text: str:
         :param orig: Optional[str]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param content_layer: Optional[ContentLayer]:  (Default value = None)
         :param formatting: Optional[Formatting]:  (Default value = None)
         :param hyperlink: Optional[Union[AnyUrl, Path]]:  (Default value = None)
@@ -4095,7 +4175,7 @@ class DoclingDocument(BaseModel):
         code_language: Optional[CodeLanguageLabel] = None,
         orig: Optional[str] = None,
         caption: Optional[Union[TextItem, RefItem]] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
         hyperlink: Optional[Union[AnyUrl, Path]] = None,
@@ -4108,7 +4188,7 @@ class DoclingDocument(BaseModel):
         :param code_language: Optional[str]: (Default value = None)
         :param orig: Optional[str]:  (Default value = None)
         :param caption: Optional[Union[TextItem, RefItem]]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param content_layer: Optional[ContentLayer]:  (Default value = None)
         :param formatting: Optional[Formatting]:  (Default value = None)
         :param hyperlink: Optional[Union[AnyUrl, Path]]:  (Default value = None)
@@ -4150,7 +4230,7 @@ class DoclingDocument(BaseModel):
         sibling: NodeItem,
         text: str,
         orig: Optional[str] = None,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
         hyperlink: Optional[Union[AnyUrl, Path]] = None,
@@ -4161,7 +4241,7 @@ class DoclingDocument(BaseModel):
         :param sibling: NodeItem:
         :param text: str:
         :param orig: Optional[str]:  (Default value = None)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param content_layer: Optional[ContentLayer]:  (Default value = None)
         :param formatting: Optional[Formatting]:  (Default value = None)
         :param hyperlink: Optional[Union[AnyUrl, Path]]:  (Default value = None)
@@ -4200,7 +4280,7 @@ class DoclingDocument(BaseModel):
         text: str,
         orig: Optional[str] = None,
         level: LevelNumber = 1,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         content_layer: Optional[ContentLayer] = None,
         formatting: Optional[Formatting] = None,
         hyperlink: Optional[Union[AnyUrl, Path]] = None,
@@ -4212,7 +4292,7 @@ class DoclingDocument(BaseModel):
         :param text: str:
         :param orig: Optional[str]:  (Default value = None)
         :param level: LevelNumber:  (Default value = 1)
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param content_layer: Optional[ContentLayer]:  (Default value = None)
         :param formatting: Optional[Formatting]:  (Default value = None)
         :param hyperlink: Optional[Union[AnyUrl, Path]]:  (Default value = None)
@@ -4250,14 +4330,14 @@ class DoclingDocument(BaseModel):
         self,
         sibling: NodeItem,
         graph: GraphData,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         after: bool = True,
     ) -> KeyValueItem:
         """Creates a new KeyValueItem item and inserts it into the document.
 
         :param sibling: NodeItem:
         :param graph: GraphData:
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param after: bool:  (Default value = True)
 
         :returns: KeyValueItem: The newly created KeyValueItem item.
@@ -4279,14 +4359,14 @@ class DoclingDocument(BaseModel):
         self,
         sibling: NodeItem,
         graph: GraphData,
-        prov: Optional[ProvenanceItem] = None,
+        prov: Optional[ProvenanceType] = None,
         after: bool = True,
     ) -> FormItem:
         """Creates a new FormItem item and inserts it into the document.
 
         :param sibling: NodeItem:
         :param graph: GraphData:
-        :param prov: Optional[ProvenanceItem]:  (Default value = None)
+        :param prov: Optional[ProvenanceType]:  (Default value = None)
         :param after: bool:  (Default value = True)
 
         :returns: FormItem: The newly created FormItem item.
@@ -4654,7 +4734,11 @@ class DoclingDocument(BaseModel):
                 not isinstance(root, DocItem)
                 or (
                     page_nrs is None
-                    or any(prov.page_no in page_nrs for prov in root.prov)
+                    or any(
+                        prov.page_no in page_nrs
+                        for prov in root.prov
+                        if isinstance(prov, ProvenanceItem)
+                    )
                 )
             )
             and root.content_layer in my_layers
@@ -4764,7 +4848,7 @@ class DoclingDocument(BaseModel):
         image_dir.mkdir(parents=True, exist_ok=True)
 
         if image_dir.is_dir():
-            for item, level in result.iterate_items(page_no=page_no, with_groups=False):
+            for item, _ in result.iterate_items(page_no=page_no, with_groups=False):
                 if isinstance(item, PictureItem):
                     img = item.get_image(doc=self)
                     if img is not None:
@@ -4784,12 +4868,15 @@ class DoclingDocument(BaseModel):
                             else:
                                 obj_path = loc_path
 
-                            if item.image is None:
+                            if item.image is None and isinstance(
+                                item.prov[0], ProvenanceItem
+                            ):
                                 scale = img.size[0] / item.prov[0].bbox.width
                                 item.image = ImageRef.from_pil(
                                     image=img, dpi=round(72 * scale)
                                 )
-                            item.image.uri = Path(obj_path)
+                            elif item.image is not None:
+                                item.image.uri = Path(obj_path)
 
                         # if item.image._pil is not None:
                         #    item.image._pil.close()
@@ -6268,7 +6355,11 @@ class DoclingDocument(BaseModel):
                     if isinstance(new_item, DocItem):
                         # update page numbers
                         # NOTE other prov sources (e.g. GraphCell) currently not covered
-                        for prov in new_item.prov:
+                        for prov in (
+                            item
+                            for item in new_item.prov
+                            if isinstance(item, ProvenanceItem)
+                        ):
                             prov.page_no += page_delta
 
                     if item.parent:
